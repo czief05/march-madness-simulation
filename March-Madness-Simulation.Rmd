@@ -1,0 +1,792 @@
+---
+title: "March Madness"
+output: html_document
+---
+
+### Executive Summary
+Over the past few decades, the Wisconsin Badgers have embodied March Madness consistency, regularly earning high seeds in the NCAA Tournament. Last year was no exception, as the Badgers entered the tournament as a three-seed. However, even with their strong record and powerful playmaking, the unpredictability of single-elimination basketball led to an early second-round exit against BYU. This outcome left fans and analysts alike wondering: how far could the Badgers have gone? We sought to answer that question using statistical modeling and tournament simulation to estimate the Badgers' chances of reaching the Final Four, and even winning the tournament, given that they advanced past the second round. 
+
+We used NCAA basketball regular-season data, along with offensive and defensive efficiency metrics, to build a Bradley-Terry model that estimated each team's likelihood of beating any other team. These probabilities allowed us to simulate individual games with the random chance that one team has to beat another. Using these probabilities, we then simulated the entire NCAA tournament 10,000 times, keeping track of the outcome of every game through the championship in each simulation. Running thousands of simulations created a range of possible tournament scenarios based on game odds rather than assumptions or intuition. Using this data, we could count how many times each possible outcome occurred, whether it was as common as the Badgers winning their first game or as rare as them winning the entire tournament. 
+
+Wisconsin advanced to the Sweet Sixteen in over 60% of all 10,000 tournament simulations, the second highest of the four three-seed teams, reflecting their overall strength. After those Sweet Sixteen appearances, the Badgers reached the Final Four in 8.58% simulations, and became champions only 0.4% of the time. These results show that, despite Wisconsin's strong seeding and advancement past the second round in over half of the simulations, achieving consistent success beyond that point would have been difficult. Wisconsin may have had the talent and efficiency to make a deep run in the tournament, but their road to victory would have been challenging and improbable. The simulations also highlighted the volatility of March Madness, showing that even top seeds occasionally fell early, while lower-seeded teams occasionally found surprising success. Overall, our analysis found that Wisconsin was a strong but not dominant contender, capable but unlikely to reach the Final Four and possibly return home as champions.
+
+This project provides a data-driven perspective on the unpredictable nature of March Madness. For coaches, it highlights how slight differences in matchups and team efficiency can dramatically influence tournament outcomes. For fans, it offers a clearer sense of what "making a run" truly means in probabilistic terms, illustrating both the strength and uncertainty behind every game. Ultimately, the analysis shows how statistical modeling and simulations can deepen understanding of different probabilities and bring more excitement to basketball's most unpredictable tournament.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(hoopR)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(BradleyTerry2)
+library(rvest)
+library(httr)
+library(jsonlite)
+```
+
+### Load Games
+The base of our data is NCAA Men's basketball box scores downloaded from the HoopR package. Since we are simulating the 2025 March Madness Bracket, we will use only 2025 season data.
+```{r}
+team_scores <- load_mbb_team_box(season = 2025)
+```
+
+
+### Data Cleaning
+After loading the box score data, we had to clean up several things to prepare it for modeling. First, each game appeared twice, one for the home team and one for the away team. We only wanted one row per game, so we filtered to get distinct game IDs. Additionally, we created variables to label the home and away teams and their scores for each game. Since this is a March Madness simulation, we only want regular season games, which is why we filter for `season_type == 2`. Finally, we generated binary variables to capture whether the home or away team won each matchup.
+```{r}
+home_away_scores <- team_scores %>% 
+  distinct(game_id, .keep_all = TRUE) %>% 
+  mutate(home_team = ifelse(team_home_away == "home", team_location, opponent_team_location),
+        away_team = ifelse(team_home_away == "away", team_location, opponent_team_location),
+        home_team_score = ifelse(team_home_away == "home", team_score, opponent_team_score),
+        away_team_score = ifelse(team_home_away == "away", team_score, opponent_team_score)) %>% 
+  filter(season_type == 2) %>% 
+  select(home_team, home_team_score, away_team, away_team_score) %>% 
+  mutate(home_win = ifelse(home_team_score > away_team_score, 1, 0),
+         away_win = ifelse(home_win == 1, 0, 1))
+
+unique_teams = sort(unique(c(home_away_scores$home_team, home_away_scores$away_team)))
+
+```
+
+
+### Data Prep For Model
+To prepare the data for model fitting, game results were aggregated to create matchup-level data, where each row represents a unique home-away pairing. We summed the win totals across the matchups, which enables the Bradley-Terry model to estimate relative latent team strengths from head-to-head outcomes. To give an idea of what we did, we filtered the data to show five of Wisconsin's regular-season home games, their opponents, and the outcomes of each matchup displayed below.
+```{r}
+home_away_matchups <- home_away_scores %>% 
+  group_by(home_team, away_team) %>% 
+  summarize(home.win = sum(home_win), away.win = sum(away_win), .groups = "drop") %>% 
+  rename(home.team = home_team, away.team = away_team) %>% 
+  mutate(
+    home.team = factor(home.team, levels = unique_teams),
+    away.team = factor(away.team,levels = unique_teams))
+
+home_away_matchups %>% filter(home.team == "Wisconsin") %>% head(5)
+```
+
+
+### Initial Fit
+We began by fitting a baseline Bradley-Terry model using only game outcomes to estimate each team's latent strengths. The model compares home and away teams in each matchup and estimates each team's ability relative to a reference team, which we set to Yale in this initial fit. This fit provides a solid foundation for evaluating how wins and losses across specific matchups explain team strength. Later, we will introduce additional efficiency covariates into this model and assess how these factors may affect team strength.
+```{r}
+fit <-BTm(outcome = cbind(home.win, away.win),
+    player1 = home.team, player2 = away.team,
+    refcat = "Yale",
+    data = home_away_matchups)
+```
+
+
+### Abilities Dataframe
+After fitting the baseline model, we extracted each team's estimated ability parameter using the `BTabilities()` function from the BradleyTerry2 R package. These values represent latent relative strenghts of each team compared to year, meaning the log-odds that each team has of beating Yale. We then organized the results into a dataframe for more straightforward interpretation and comparison across teams. This dataframe includes the estimated abilities for all teams that played at least one game against a Division 1 opponent during the season.
+```{r}
+lambda_hat <- BTabilities(fit)
+abilities <- data.frame(team = rownames(lambda_hat), lambda_hat, row.names = NULL)
+```
+
+
+### Tournament Teams Abilites 
+To run the simulation, we only needed the abilities of the 64 teams competing in the March Madness tournament. Therefore, we selected the names of those teams and created a smaller sub-dataframe containing only their estimated abilities. Displayed below are the top five teams based on their predicted latent abilities (compared to Yale), with Florida having the strongest ability and Auburn close behind.
+```{r}
+teams_64 <- c(
+    "Duke", "Baylor", "Oregon", "Arizona", "BYU", "Wisconsin", "Saint Mary's", "Alabama",
+    "Mississippi State", "Vanderbilt", "VCU", "Liberty", "Akron", "Montana", "Robert Morris", "Mount St. Mary's",
+    "Florida", "UConn", "Memphis", "Maryland", "Missouri", "Texas Tech", "Kansas", "St. John's",
+    "Oklahoma", "Arkansas", "Drake", "Colorado State", "Grand Canyon", "UNC Wilmington", "Omaha", "Norfolk State",
+    "Auburn", "Louisville", "Michigan", "Texas A&M", "Ole Miss", "Iowa State", "Marquette", "Michigan State",
+    "Creighton", "North Carolina", "Yale", "Lipscomb", "New Mexico", "Bryant", "UC San Diego", "Alabama State",
+    "Houston", "Tennessee", "Purdue", "Kentucky", "Illinois", "UCLA", "Gonzaga", "Clemson",
+    "McNeese", "Utah State", "High Point", "Troy", "Georgia", "SIU Edwardsville", "Xavier", "Wofford"
+)
+
+abilities_64 <- abilities %>% filter(team %in% teams_64)
+
+abilities_64 <- abilities_64 %>% arrange(desc(ability))
+abilities_64 %>% head(5)
+```
+
+
+### Latent Ability Graph
+Below is a graph of every team's latent strength relative to the team Yale:
+```{r}
+abilities_64 %>%
+  arrange(ability) %>%
+  mutate(team = factor(team, levels = team)) %>%
+  ggplot(aes(x = team, y = ability)) +
+  geom_col(fill = "skyblue3") +
+  geom_errorbar(
+    aes(ymin = ability - 1.96 * s.e.,
+        ymax = ability + 1.96 * s.e.),
+    width = 0.3, color = "gray30"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Latent Strength Relative to Yale",
+    x = "Team",
+    y = "Ability Estimate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.y = element_text(size = 5, face = "bold"),   # smaller team labels
+    axis.text.x = element_text(size = 9, face = "bold"),  # x-axis labels (optional)
+    plot.title = element_text(size = 14, face = "bold")
+  )
+```
+
+
+### Update fit for more central abilities
+The graph above shows the estimated abilities of all tournament teams. It is clear that these abilities are not centrally fit; therefore, we chose a more central reference team: VCU. We then had to create our estimated ability dataframe again for the tournament teams using the new VCU reference team.
+```{r}
+fit_new <- update(fit, refcat = "VCU")
+
+lambda_hat <- BTabilities(fit_new)
+abilities <- data.frame(team = rownames(lambda_hat), lambda_hat, row.names = NULL)
+
+abilities_64 <- abilities %>% filter(team %in% teams_64) %>% arrange(by = desc(ability))
+abilities_64 %>% head(10)
+```
+
+
+# New Abilities Graph
+Here is the updated graph of team latent strengths relative to VCU:
+```{r}
+abilities_64 %>%
+  arrange(ability) %>%
+  mutate(team = factor(team, levels = team)) %>%
+  ggplot(aes(x = team, y = ability)) +
+  geom_col(fill = "skyblue3") +
+  geom_errorbar(
+    aes(ymin = ability - 1.96 * s.e.,
+        ymax = ability + 1.96 * s.e.),
+    width = 0.3, color = "gray30"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Latent Strength Relative to VCU",
+    x = "Team",
+    y = "Ability Estimate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.y = element_text(size = 5, face = "bold"),   # smaller team labels
+    axis.text.x = element_text(size = 9, face = "bold"),  # x-axis labels (optional)
+    plot.title = element_text(size = 14, face = "bold")
+  )
+```
+
+
+### Implementing Offensive and Defensive Efficiencies
+To improve our model, we incorporated team offensive and defensive adjusted efficiencies. These are key performance measures we pulled from Bart Torvik's "T-Rank" data. Bart Torvik's site is a widely used analytics resource that provides advanced college basketball metrics, and his site was one of the references used in the NCAA Tournament selection process this past year. Offensive efficiency (adjOE) is defined as the number of points a team scores per 100 possessions, adjusted for opponent quality and the location of the game (home, neutral, away). Similarly, defensive efficiency (adjDE) measures how many points a team allowed per 100 possessions, adjusting for opponent quality and game location.
+
+According to Bart Torvik's site, the calculation of adjusted offensive and defensive efficiencies is defined as:
+$$
+\text{Game AdjOE} = 
+\frac{\text{Points per Possession (Offense)}}{(\text{Opponent AdjDE} / \text{Average PPP})}
+$$
+
+$$
+\text{Game AdjDE} = 
+\frac{\text{Points per Possession (Defense)}}{(\text{Opponent AdjOE} / \text{Average PPP})}
+$$
+These values are further adjusted by ± 1.4 to account for home and away effects. There is no adjustment for neutral-site games. By integrating adjOE and adjDE into our dataset, we allow the model to account for a team's offensive and defensive quality rather than relying only on wins and losses.
+
+
+### Scraping Efficiencies from Bart Torvik
+Bart Torvik makes all of his data available for free on his site. We scraped this data directly from Torvik's website using a JSON file containing all team statistics as of Selection Sunday (the final day of games played before the NCAA Tournament). This ensures that our model will capture teams' true pre-tournament strength. From this data, we filter to only grab the columns team, adjOE, and adjDE since that is all we need for our model.
+```{r}
+#Selection Sunday efficiencies (Pre-tournament)
+
+url <- "https://barttorvik.com/timemachine/team_results/20250316_team_results.json.gz"
+download.file(url, destfile = "team_results_20250316.json.gz")
+
+data <- fromJSON("team_results_20250316.json.gz")
+
+pretournament_eff <- as.data.frame(data)
+pretournament_eff <- pretournament_eff %>% rename(team = V2, adjOE = V5, adjDE = V7) %>% 
+  select(team, adjOE, adjDE)
+```
+
+
+### Mapping teams between the two datasets
+While trying to merge efficiency data with the matchups dataset, we noticed that the team names on Bart Torvik's site do not match those in the matchups dataset. To check for inconsistencies, we first extracted all unique teams from both datasets, then compared the lists to identify which Torvik teams were missing from the matchup data.
+```{r}
+torvik_teams <- pretournament_eff$team %>% unique() %>% sort()
+
+matchup_teams <- home_away_matchups %>%
+  select(home.team, away.team) %>%
+  unlist() %>%
+  unique() %>%
+  sort()
+
+torvik_missing <- tibble(torvik_team = torvik_teams) %>%
+  mutate(in_matchups = torvik_team %in% matchup_teams) %>%
+  filter(!in_matchups)
+```
+After identifying the unmatched teams, we created a name mapping table to standardize team names. The tibble below pairs each team's name, as listed in our Bart Torvik data, with the corresponding name in our matchup dataset. This step ensures that both data sources align when merging data, preventing mismatches and NA values. Most of the differences were that one source abbreviated "State" as "St." For example, Michigan State vs Michigan St.
+```{r}
+team_name_map <- tibble(
+  torvik_name   = c("Alabama St.", "Albany", "Alcorn St.", "American", "Appalachian St.", "Arizona St.",
+                    "Arkansas Pine Bluff", "Arkansas St.", "Ball St.", "Bethune Cookman", "Boise St.",
+                    "Cal Baptist", "Cal St. Bakersfield", "Cal St. Fullerton", "Cal St. Northridge",
+                    "Chicago St.", "Cleveland St.", "Colorado St.", "Connecticut", "Coppin St.",
+                    "Delaware St.", "East Tennessee St.", "FIU", "Florida St.", "Fresno St.",
+                    "Georgia St.", "Grambling St.", "Hawaii", "Idaho St.", "Illinois Chicago", "Illinois St.",
+                    "Indiana St.", "Iowa St.", "IU Indy", "Jackson St.", "Jacksonville St.", "Kansas St.",
+                    "Kennesaw St.", "Kent St.", "LIU", "Long Beach St.", "Louisiana Monroe", "Loyola MD",
+                    "McNeese St.", "Miami FL", "Miami OH", "Michigan St.", "Mississippi", "Mississippi St.",
+                    "Mississippi Valley St.", "Missouri St.", "Montana St.", "Morehead St.", "Morgan St.",
+                    "Murray St.", "N.C. State", "Nebraska Omaha", "New Mexico St.", "Nicholls St.",
+                    "Norfolk St.", "North Dakota St.", "Northwestern St.", "Ohio St.", "Oklahoma St.",
+                    "Oregon St.", "Penn", "Penn St.", "Portland St.", "Queens", "Sacramento St.",
+                    "Saint Francis", "Sam Houston St.", "San Diego St.", "San Jose St.", "Seattle",
+                    "South Carolina St.", "South Dakota St.", "Southeast Missouri St.",
+                    "Southeastern Louisiana", "St. Thomas", "Tarleton St.", "Tennessee Martin",
+                    "Tennessee St.", "Texas A&M Commerce", "Texas A&M Corpus Chris", "Texas St.",
+                    "UMKC", "USC Upstate", "Utah St.", "Washington St.", "Weber St.", "Wichita St.",
+                    "Wright St.", "Youngstown St."),
+  
+  matchup_name  = c("Alabama State", "UAlbany", "Alcorn State", "American University", "App State",
+                    "Arizona State", "Arkansas-Pine Bluff", "Arkansas State", "Ball State", "Bethune-Cookman",
+                    "Boise State", "California Baptist", "Cal State Bakersfield", "Cal State Fullerton",
+                    "Cal State Northridge", "Chicago State", "Cleveland State", "Colorado State", "UConn",
+                    "Coppin State", "Delaware State", "East Tennessee State", "Florida International",
+                    "Florida State", "Fresno State", "Georgia State", "Grambling", "Hawai'i", "Idaho State",
+                    "UIC", "Illinois State", "Indiana State", "Iowa State", "IU Indianapolis", "Jackson State",
+                    "Jacksonville State", "Kansas State", "Kennesaw State", "Kent State",
+                    "Long Island University", "Long Beach State", "UL Monroe", "Loyola Maryland", "McNeese",
+                    "Miami", "Miami (OH)", "Michigan State", "Ole Miss", "Mississippi State",
+                    "Mississippi Valley State", "Missouri State", "Montana State", "Morehead State",
+                    "Morgan State", "Murray State", "NC State", "Omaha", "New Mexico State", "Nicholls",
+                    "Norfolk State", "North Dakota State", "Northwestern State", "Ohio State",
+                    "Oklahoma State","Oregon State", "Pennsylvania", "Penn State", "Portland State",
+                    "Queens University","Sacramento State", "St. Francis (PA)", "Sam Houston",
+                    "San Diego State", "San José State", "Seattle U", "South Carolina State",
+                    "South Dakota State", "Southeast Missouri State", "SE Louisiana", "St. Thomas-Minnesota",
+                    "Tarleton State", "UT Martin", "Tennessee State", "East Texas A&M",
+                    "Texas A&M-Corpus Christi", "Texas State", "Kansas City", "South Carolina Upstate",
+                    "Utah State", "Washington State", "Weber State", "Wichita State", "Wright State",
+                    "Youngstown State")
+)
+```
+
+
+### Data Configuration Prep
+Once team names were standardized and efficiency data were collected, the next step was to merge them into a single, cohesive dataframe. To accomplish this, we first mapped the cleaned team names across the matchup data and Bart Torvik efficiency data using the `left_join()` function for home and away teams. This ensured that team names aligned with those in the efficiency data, preventing missing values later. After merging the team names, we needed to merge the offensive and defensive efficiencies into the matchup data, using `left_join()` once again for both home and away teams. 
+```{r}
+home_away_matchups_mapped <- home_away_matchups %>%
+  left_join(team_name_map, by = c("home.team" = "matchup_name")) %>%
+  mutate(home.team = if_else(!is.na(torvik_name), torvik_name, home.team)) %>%
+  select(-torvik_name) %>%
+  left_join(team_name_map, by = c("away.team" = "matchup_name")) %>%
+  mutate(away.team = if_else(!is.na(torvik_name), torvik_name, away.team)) %>%
+  select(-torvik_name)
+
+
+home_away_matchups_eff <- home_away_matchups_mapped %>% 
+  left_join(pretournament_eff %>% rename(home_adjOE = adjOE, home_adjDE = adjDE, home.team = team),
+            by = "home.team") %>%
+  left_join(pretournament_eff %>% rename(away_adjOE = adjOE, away_adjDE = adjDE, away.team = team),
+            by = "away.team") %>%
+  mutate(
+    home_adjOE = as.numeric(home_adjOE),
+    home_adjDE = as.numeric(home_adjDE),
+    away_adjOE = as.numeric(away_adjOE),
+    away_adjDE = as.numeric(away_adjDE)
+  )
+```
+
+
+### Fitting with efficiencies
+Sometimes Division 1 schools play non-Division 1 "buy games" at the beginning of the season. Bart Torvik's site does not track data for these non-Division one teams, so we needed to remove any rows that include such instances since they cause missing (NA) values. Next, we needed to find all unique teams in the dataframe and convert `home.team` and `away.team` to factors, since Bradley-Terry models require this to treat each team as a distinct competitor. We then engineered binary variables indicating whether a team held an advantage in offensive or defensive efficiency relative to its opponent. Next, we created a new temporary dataframe containing the outcomes of each game, whether the home or away team won. We then added four more columns, two for the home team and two for the away team. The columns are dataframes themselves, containing the home and away binary indicators for both offense and defense efficiency. Finally, we fit the Bradley-Terry model, now specifying the formula argument as `formula = ~ team + off_better + def_better` and the data argument as the temporary dataframe `tmp_df`. This allowed the model to estimate the impact of these covariates on win probability while still accounting for the team's underlying latent ability. The resulting coefficients, `off_lambda0_hat` and `def_lambda0_hat`, quantify the effect of offensive and defensive advantages, showing us how much each factor changes a team's likelihood of winning a given game. With these coefficients, the log-odds of team 1 beating team 2 if team 1 has better offensive and defensive efficiencies would be calculated as follows:
+$$
+(\lambda_\text{team1} - \lambda_\text{team2}) 
++ \lambda_{0_\text{off}}
++ \lambda_{0_\text{def}}
+$$
+
+```{r}
+home_away_matchups_eff_clean <- home_away_matchups_eff %>%
+  filter(!is.na(home_adjOE), !is.na(away_adjOE))
+
+unique_teams <- sort(unique(c(home_away_matchups_eff_clean$home.team,
+                              home_away_matchups_eff_clean$away.team)))
+
+home_away_matchups_eff_clean <- home_away_matchups_eff_clean %>% 
+  mutate(
+    home.team = factor(home.team, levels = unique_teams),
+    away.team = factor(away.team, levels = unique_teams),
+    home.off_better = ifelse(home_adjOE > away_adjOE, 1, 0),
+    away.off_better = ifelse(away_adjOE > home_adjOE, 1, 0),
+    home.def_better = ifelse(home_adjDE < away_adjDE, 1, 0),
+    away.def_better = ifelse(away_adjDE < home_adjDE, 1, 0)
+  )
+
+tmp_df <- data.frame(home.win = home_away_matchups_eff_clean$home.win,
+                     away.win = home_away_matchups_eff_clean$away.win)
+
+tmp_df$home.team <- data.frame(team = home_away_matchups_eff_clean$home.team,
+                               off_better = home_away_matchups_eff_clean$home.off_better,
+                               def_better = home_away_matchups_eff_clean$home.def_better)
+
+tmp_df$away.team <- data.frame(team = home_away_matchups_eff_clean$away.team,
+                               off_better = home_away_matchups_eff_clean$away.off_better,
+                               def_better = home_away_matchups_eff_clean$away.def_better)
+
+
+fit_with_eff <- BTm(
+  outcome = cbind(home.win, away.win),
+  player1 = home.team,
+  player2 = away.team,
+  formula = ~ team + off_better + def_better,
+  id = "team",
+  refcat = "VCU",
+  data = tmp_df
+)
+
+
+off_lambda0_hat <- coef(fit_with_eff)["off_better"]
+def_lambda0_hat <- coef(fit_with_eff)["def_better"]
+vcov_mat <- vcov(fit_with_eff)
+off_lambda0_se <- sqrt(vcov_mat["off_better", "off_better"])
+def_lambda0_se <- sqrt(vcov_mat["def_better", "def_better"])
+coef_table = data.frame("Coefficient" = c(off_lambda0_hat, def_lambda0_hat),
+                        "Standard Error" = c(off_lambda0_se, def_lambda0_se))
+coef_table
+```
+The estimated coefficients for the efficiency covariates were `off_better = -0.0267` and `def_better = -0.0462`. Both coefficients are negative, and their respective standard errors are small, indicating that higher offensive or defensive efficiency relative to an opponent was associated with a lower probability of winning. It does not make sense for a team with better efficiencies to see a decrease in its winning probability. Since these signs and magnitudes did not align with the expected relationship between efficiency and performance, we deemed the efficiency-adjusted model unreliable for interpretation. As a result, we decided to proceed with the original baseline fit when predicting game probabilities and tournament outcomes. 
+
+
+### Creating Probabilties DataFrame
+To simulate the tournament, we needed to be able to model every possible matchup between every team. To do this, we used the latent abilities estimated by our Bradley-Terry model to create a dataframe containing every possible matchup between team 1 and team 2 in the 64-team tournament, and included a column for the probability of team 1 defeating team 2. This means that every matchup must appear twice, with the teams swapped. First, the `expand.grid()` function created all team-pair combinations from the 64-team abilities dataframe, and pairs where a team played itself were removed afterward. We then used a `left_join()` to join each team's ability to this expanded dataframe. We then calculated the difference between the two abilities, corresponding to the log-odds that the first team beats the second. Lastly, we converted the log-odds to a probability using this formula:
+$P(\text{team}_1 \text{ wins}) = \frac{e^{(\text{log-odds})}}{1 + e^{(\text{log-odds})}}$ to create a column for the probability that team 1 defeats team 2. We used this dataset to estimate probabilities when simulating individual games.
+```{r}
+matchups <- expand.grid(
+  team1 = abilities_64$team,
+  team2 = abilities_64$team
+)
+
+matchups <- matchups %>%
+  filter(team1 != team2)
+
+matchups_probs <- matchups %>%
+  left_join(abilities_64 %>% select(team, ability), by = c("team1" = "team")) %>%
+  rename(ability1 = ability) %>%
+  left_join(abilities_64 %>% select(team, ability), by = c("team2" = "team")) %>%
+  rename(ability2 = ability) %>%
+  mutate(difference = ability1 - ability2,
+         probability = exp(difference) / (1 + exp(difference))) %>% 
+    select(-ability1, -ability2)
+
+matchups_probs %>% filter(team1 == "Wisconsin") %>% head(5)
+```
+Displayed above are the predicted log-odds and probabilities that Wisconsin beats the 5 strongest teams (predicted by the model) in the tournament.
+
+
+### Creating Region Seeding and Seeding Pairs
+The NCAA tournament is broken up into four smaller sixteen-team regional tournaments, which then feed the region winner into the Final Four. Each team in each region is assigned a seed from 1-16, and we used this code to map each team in each region to the corresponding seed they were given in the tournament. This allowed us to simulate each region, and then use the region winners to simulate the last two rounds of the tournament. Along with the region-specific seeding, in the first round specific seeds play each other, for example in the first game the 1st seed plays the 16th seed, and in the second game the 8th seed plays the 9th seed. We created a list of vectors that contain these round 1 seed pairings to ensure that when we simulate each region in the tournament the correct pairings play each other in the first round. Finally, we created another list of vectors to loop through to ensure the correct second round games are played, keeping the bracket structure intact.
+```{r}
+east_seeding <- data.frame(
+  seed = c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16),
+  team = c(
+    "Duke", "Alabama", "Wisconsin", "Arizona",
+    "Oregon", "BYU", "Saint Mary's", "Mississippi State",
+    "Baylor", "Vanderbilt", "VCU", "Liberty",
+    "Akron", "Montana", "Robert Morris", "Mount St. Mary's"
+))
+
+west_seeding <- data.frame(
+  seed = c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16),
+  team = c(
+    "Florida", "St. John's", "Texas Tech", "Maryland",
+    "Memphis", "Missouri", "Kansas", "UConn",
+    "Oklahoma", "Arkansas", "Drake", "Colorado State",
+    "Grand Canyon", "UNC Wilmington", "Omaha", "Norfolk State"
+))
+
+south_seeding <- data.frame(
+  seed = c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16),
+  team = c(
+    "Auburn", "Michigan State", "Iowa State", "Texas A&M",
+    "Michigan", "Ole Miss", "Marquette", "Louisville",
+    "Creighton", "New Mexico", "North Carolina", "UC San Diego",
+    "Yale", "Lipscomb", "Bryant", "Alabama State"
+))
+
+midwest_seeding <- data.frame(
+  seed = c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16),
+  team = c(
+    "Houston", "Tennessee", "Kentucky", "Purdue",
+    "Clemson", "Illinois", "UCLA", "Gonzaga",
+    "Georgia", "Utah State", "Xavier", "McNeese",
+    "High Point", "Troy", "Wofford", "SIU Edwardsville"
+))
+
+round64_pairs <- list(c(1,16), c(8,9), c(5,12), c(4,13),
+                      c(6,11), c(3,14), c(7,10), c(2,15))
+
+round32_pairs <- list(c(1,2), c(3,4), c(5,6), c(7,8))
+```
+
+
+### Creating seeding pairs
+Next we created a helper function for our function that randomly simulates a game and returns the winning team. You input the first team, second team, and the dataset that contains every possible matchup and the probability of the first team winning. The function filters the dataset based on the two input teams, pulls the probability of team 1 winning, and then randomly returns a team based on those odds. This function made simulating the entire tournament much shorter and easier. 	
+```{r}
+round64_pairs <- list(c(1,16), c(8,9), c(5,12), c(4,13),
+                      c(6,11), c(3,14), c(7,10), c(2,15))
+
+round32_pairs <- list(c(1,2), c(3,4), c(5,6), c(7,8))
+```
+
+
+### Creating Simulate Game Function
+Next we created a helper function for our function that randomly simulates a game and returns the winning team. You input the first team, second team, and the dataset that contains every possible matchup and the probability of the first team winning. The function filters the dataset based on the two input teams, pulls the probability of team 1 winning, and utilized the `rbinom()` function to randomly draw a victor based on that probability. 
+```{r}
+simulate_game <- function(first_team, second_team, probs_df) {
+  p <- probs_df %>%
+    filter(team1 == first_team, team2 == second_team) %>%
+    pull(probability)
+  
+winner <- ifelse(rbinom(1, 1, p) == 1, first_team, second_team)
+  return(winner)
+}
+```
+
+
+### Creating Results DataFrame
+The NCAA tournament is broken into four smaller sixteen-team regional tournaments, which then send the regional winners to the Final Four. Each team in each region is assigned a seed from 1-16, and we used the code below to map each team to its corresponding seed in the tournament. This allowed us to simulate each region, and then use the region winners to simulate the last two rounds of the tournament. Along with region-specific seeding, in the first round, specific seeds play each other. For example, in the first game, the 1st seed plays the 16th seed, and in the second game, the 8th seed plays the 9th seed. We created a list of vectors containing these round 1 seed pairings to ensure that, when we simulate each region in the tournament, the correct pairings play each other in the first round. Finally, we created another list of vectors to loop through to ensure the correct second-round games are played, keeping the bracket structure intact.
+```{r}
+n_sims <- 10000
+
+results <- data.frame(
+  IDX = 1:n_sims,
+  East_r64_1 = rep(NA, times = n_sims),
+  East_r64_2 = rep(NA, times = n_sims),
+  East_r64_3 = rep(NA, times = n_sims),
+  East_r64_4 = rep(NA, times = n_sims),
+  East_r64_5 = rep(NA, times = n_sims),
+  East_r64_6 = rep(NA, times = n_sims),
+  East_r64_7 = rep(NA, times = n_sims),
+  East_r64_8 = rep(NA, times = n_sims),
+  Midwest_r64_1 = rep(NA, times = n_sims),
+  Midwest_r64_2 = rep(NA, times = n_sims),
+  Midwest_r64_3 = rep(NA, times = n_sims),
+  Midwest_r64_4 = rep(NA, times = n_sims),
+  Midwest_r64_5 = rep(NA, times = n_sims),
+  Midwest_r64_6 = rep(NA, times = n_sims),
+  Midwest_r64_7 = rep(NA, times = n_sims),
+  Midwest_r64_8 = rep(NA, times = n_sims),
+  South_r64_1 = rep(NA, times = n_sims),
+  South_r64_2 = rep(NA, times = n_sims),
+  South_r64_3 = rep(NA, times = n_sims),
+  South_r64_4 = rep(NA, times = n_sims),
+  South_r64_5 = rep(NA, times = n_sims),
+  South_r64_6 = rep(NA, times = n_sims),
+  South_r64_7 = rep(NA, times = n_sims),
+  South_r64_8 = rep(NA, times = n_sims),
+  West_r64_1 = rep(NA, times = n_sims),
+  West_r64_2 = rep(NA, times = n_sims),
+  West_r64_3 = rep(NA, times = n_sims),
+  West_r64_4 = rep(NA, times = n_sims),
+  West_r64_5 = rep(NA, times = n_sims),
+  West_r64_6 = rep(NA, times = n_sims),
+  West_r64_7 = rep(NA, times = n_sims),
+  West_r64_8 = rep(NA, times = n_sims),
+  East_r32_1 = rep(NA, times = n_sims),
+  East_r32_2 = rep(NA, times = n_sims),
+  East_r32_3 = rep(NA, times = n_sims),
+  East_r32_4 = rep(NA, times = n_sims),
+  Midwest_r32_1 = rep(NA, times = n_sims),
+  Midwest_r32_2 = rep(NA, times = n_sims),
+  Midwest_r32_3 = rep(NA, times = n_sims),
+  Midwest_r32_4 = rep(NA, times = n_sims),
+  South_r32_1 = rep(NA, times = n_sims),
+  South_r32_2 = rep(NA, times = n_sims),
+  South_r32_3 = rep(NA, times = n_sims),
+  South_r32_4 = rep(NA, times = n_sims),
+  West_r32_1 = rep(NA, times = n_sims),
+  West_r32_2 = rep(NA, times = n_sims),
+  West_r32_3 = rep(NA, times = n_sims),
+  West_r32_4 = rep(NA, times = n_sims),
+  East_s16_1 = rep(NA, times = n_sims),
+  East_s16_2 = rep(NA, times = n_sims),
+  Midwest_s16_1 = rep(NA, times = n_sims),
+  Midwest_s16_2 = rep(NA, times = n_sims),
+  South_s16_1 = rep(NA, times = n_sims),
+  South_s16_2 = rep(NA, times = n_sims),
+  West_s16_1 = rep(NA, times = n_sims),
+  West_s16_2 = rep(NA, times = n_sims),
+  East_champ = rep(NA, times = n_sims),
+  Midwest_champ = rep(NA, times = n_sims),
+  South_champ = rep(NA, times = n_sims),
+  West_champ = rep(NA, times = n_sims),
+  Final_4_winner_1 = rep(NA, times = n_sims),
+  Final_4_winner_2 = rep(NA, times = n_sims),
+  Champion = rep(NA, times = n_sims)
+  )
+```
+
+
+### Simulation
+To simulate the entire tournament, we first needed to create a loop that simulates the tournament, stores the games, and then continues simulating until we reach 10,000 iterations. We simulated each region until we had four regional champions, then simulated the final four, and finally the championship. For the first rounds, we looped through the earlier-created round pairings, pulled the correct two teams from their regional seeding maps, simulated the games, and placed them in their respective spots in the simulation results dataframe. After the first round, teams were drawn from the results bracket to simulate the next game. This ensured that the bracket structure would not be lost, since each round after the first drew teams from the previous rounds' results. This pattern continued until a regional champion was determined, then two finalists, and lastly a champion. Every game winner was stored, and then the loop would continue, starting over with another simulation.
+```{r, cache=TRUE}
+for (i in 1:n_sims) {
+  set.seed(2+i)
+  
+# East Bracket Simulation
+  for (j in seq_along(round64_pairs)) {
+    t1 <- east_seeding %>% filter(seed == round64_pairs[[j]][1]) %>% pull(team)
+    t2 <- east_seeding %>% filter(seed == round64_pairs[[j]][2]) %>% pull(team)
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("East_r64_", j)] <- winner
+  }
+  
+  for (j in seq_along(round32_pairs)) {
+    t1 <- results[i, paste0("East_r64_", round32_pairs[[j]][1])]
+    t2 <- results[i, paste0("East_r64_", round32_pairs[[j]][2])]
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("East_r32_", j)] <- winner
+  }
+  
+  East_s16_1_t1 <- results[i, "East_r32_1"]
+  East_s16_1_t2 <- results[i, "East_r32_2"]
+  winner <- simulate_game(East_s16_1_t1, East_s16_1_t2, matchups_probs) 
+  results[i, "East_s16_1"] <- winner
+  
+  East_s16_2_t1<- results[i, "East_r32_3"]
+  East_s16_2_t2 <- results[i, "East_r32_4"]
+  winner <- simulate_game(East_s16_2_t1, East_s16_2_t2, matchups_probs) 
+  results[i, "East_s16_2"] <- winner
+  
+  East_champ_t1<- results[i, "East_s16_1"]
+  East_champ_t2 <- results[i, "East_s16_2"]
+  winner <- simulate_game(East_champ_t1, East_champ_t2, matchups_probs) 
+  results[i, "East_champ"] <- winner
+  
+
+# Midwest Bracket Simulation
+  for (j in seq_along(round64_pairs)) {
+    t1 <- midwest_seeding %>% filter(seed == round64_pairs[[j]][1]) %>% pull(team)
+    t2 <- midwest_seeding %>% filter(seed == round64_pairs[[j]][2]) %>% pull(team)
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("Midwest_r64_", j)] <- winner
+  }
+  
+  for (j in seq_along(round32_pairs)) {
+    t1 <- results[i, paste0("Midwest_r64_", round32_pairs[[j]][1])]
+    t2 <- results[i, paste0("Midwest_r64_", round32_pairs[[j]][2])]
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("Midwest_r32_", j)] <- winner
+  }
+  
+  Midwest_s16_1_t1<- results[i, "Midwest_r32_1"]
+  Midwest_s16_1_t2 <- results[i, "Midwest_r32_2"]
+  winner <- simulate_game(Midwest_s16_1_t1, Midwest_s16_1_t2, matchups_probs) 
+  results[i, "Midwest_s16_1"] <- winner
+  
+  Midwest_s16_2_t1<- results[i, "Midwest_r32_3"]
+  Midwest_s16_2_t2 <- results[i, "Midwest_r32_4"]
+  winner <- simulate_game(Midwest_s16_2_t1, Midwest_s16_2_t2, matchups_probs) 
+  results[i, "Midwest_s16_2"] <- winner
+  
+  Midwest_champ_t1<- results[i, "Midwest_s16_1"]
+  Midwest_champ_t2 <- results[i, "Midwest_s16_2"]
+  winner <- simulate_game(Midwest_champ_t1, Midwest_champ_t2, matchups_probs) 
+  results[i, "Midwest_champ"] <- winner
+  
+
+# South Bracket Simulation
+  for (j in seq_along(round64_pairs)) {
+    t1 <- south_seeding %>% filter(seed == round64_pairs[[j]][1]) %>% pull(team)
+    t2 <- south_seeding %>% filter(seed == round64_pairs[[j]][2]) %>% pull(team)
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("South_r64_", j)] <- winner
+  }
+  
+  for (j in seq_along(round32_pairs)) {
+    t1 <- results[i, paste0("South_r64_", round32_pairs[[j]][1])]
+    t2 <- results[i, paste0("South_r64_", round32_pairs[[j]][2])]
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("South_r32_", j)] <- winner
+  }
+  
+  South_s16_1_t1<- results[i, "South_r32_1"]
+  South_s16_1_t2 <- results[i, "South_r32_2"]
+  winner <- simulate_game(South_s16_1_t1, South_s16_1_t2, matchups_probs) 
+  results[i, "South_s16_1"] <- winner
+  
+  South_s16_2_t1<- results[i, "South_r32_3"]
+  South_s16_2_t2 <- results[i, "South_r32_4"]
+  winner <- simulate_game(South_s16_2_t1, South_s16_2_t2, matchups_probs) 
+  results[i, "South_s16_2"] <- winner
+  
+  South_champ_t1<- results[i, "South_s16_1"]
+  South_champ_t2 <- results[i, "South_s16_2"]
+  winner <- simulate_game(South_champ_t1, South_champ_t2, matchups_probs) 
+  results[i, "South_champ"] <- winner
+  
+  
+# West Bracket Simulation
+  for (j in seq_along(round64_pairs)) {
+    t1 <- west_seeding %>% filter(seed == round64_pairs[[j]][1]) %>% pull(team)
+    t2 <- west_seeding %>% filter(seed == round64_pairs[[j]][2]) %>% pull(team)
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("West_r64_", j)] <- winner
+  }
+  
+  for (j in seq_along(round32_pairs)) {
+    t1 <- results[i, paste0("West_r64_", round32_pairs[[j]][1])]
+    t2 <- results[i, paste0("West_r64_", round32_pairs[[j]][2])]
+    winner <- simulate_game(t1, t2, matchups_probs)
+    results[i, paste0("West_r32_", j)] <- winner
+  }
+  
+  West_s16_1_t1<- results[i, "West_r32_1"]
+  West_s16_1_t2 <- results[i, "West_r32_2"]
+  winner <- simulate_game(West_s16_1_t1, West_s16_1_t2, matchups_probs) 
+  results[i, "West_s16_1"] <- winner
+  
+  West_s16_2_t1<- results[i, "West_r32_3"]
+  West_s16_2_t2 <- results[i, "West_r32_4"]
+  winner <- simulate_game(West_s16_2_t1, West_s16_2_t2, matchups_probs) 
+  results[i, "West_s16_2"] <- winner
+  
+  West_champ_t1<- results[i, "West_s16_1"]
+  West_champ_t2 <- results[i, "West_s16_2"]
+  winner <- simulate_game(West_champ_t1, West_champ_t2, matchups_probs) 
+  results[i, "West_champ"] <- winner
+  
+  
+# Final Four Simulation
+  East_champ <- results[i, "East_champ"]
+  Midwest_champ <- results[i, "Midwest_champ"]
+  winner <- simulate_game(East_champ, Midwest_champ, matchups_probs)
+  results[i, "Final_4_winner_1"] <- winner
+
+  South_champ <- results[i, "South_champ"]
+  West_champ <- results[i, "West_champ"]
+  winner <- simulate_game(South_champ, West_champ, matchups_probs)
+  results[i, "Final_4_winner_2"] <- winner
+
+# Championship Simulation
+  Final_4_winner_1 <- results[i, "Final_4_winner_1"]
+  Final_4_winner_2 <- results[i, "Final_4_winner_2"]
+  winner <- simulate_game(Final_4_winner_1, Final_4_winner_2, matchups_probs)
+  results[i, "Champion"] <- winner
+
+}
+
+results %>% group_by(Champion) %>% summarize(championship_wins = n()) %>% 
+  arrange(desc(championship_wins)) %>% head(14)
+```
+After 10,000 simulations, we can group the results by champion and see that Florida won the most championships with 308 simulations or over 30%. Wisconsin tied with Oregon in 13th place with 25 championship wins. 
+
+
+### Three-seed comparison
+To contextualize Wisconsin’s performance, we first compared their simulation results against the other three #3 seeds in the tournament: Iowa State, Texas Tech, and Kentucky. We tracked the total number of times each team advanced to the Sweet Sixteen across all 10,000 simulations to gauge their relative strength as projected by our model.
+```{r}
+Wisconsin_sw16 <- results %>% filter(East_r32_3 == "Wisconsin") %>% nrow()
+Iowa_sw16 <- results %>% filter(South_r32_3 == "Iowa State") %>% nrow()
+TexasTech_sw16 <- results %>% filter(West_r32_3 == "Texas Tech") %>% nrow()
+Kentucky_sw16 <- results %>% filter(Midwest_r32_3 == "Kentucky") %>% nrow()
+
+three_seed_sw16 <- data.frame(Team = c("Wisconsin", "Iowa State", "Texas Tech", "Kentucky"),
+                              Sweet_16_Entries = c(Wisconsin_sw16, Iowa_sw16, TexasTech_sw16, Kentucky_sw16)) %>% 
+  arrange(desc(Sweet_16_Entries))
+
+ggplot(three_seed_sw16, aes(x = reorder(Team,-Sweet_16_Entries), y = Sweet_16_Entries, fill = Team)) +
+  geom_col(color = "black") +
+  scale_fill_manual(values = c(
+  "Wisconsin" = "#C5050C",
+  "Iowa State" = "#F1BE48",
+  "Texas Tech" = "#000",
+  "Kentucky" = "#0033A0")) +
+  geom_text(aes(label = Sweet_16_Entries), vjust = -0.3, size = 4) +
+  labs(title = "Three-seed Sweet Sixteen Appearances (10,000 Simulations)",
+       x = "Three-Seeded Teams",
+       y = "Number of Sweet 16 Appearances") +
+  ylim(0,8000) +
+  theme_classic() + 
+  theme(legend.position = "none")
+```
+
+As the “Three-seed Sweet Sixteen Comparison” grqph shows, Wisconsin was among the strongest of its peers. The Badgers successfully reached the Sweet Sixteen in 6,279 simulations, which is more than 60% of the time. This was the second-highest total in the group, trailing just behind Kentucky, which amassed 7,269 appearances. This analysis confirms that our model viewed Wisconsin as a robust contender, fully justifying their high seed and reflecting their strong regular-season performance
+
+
+## Analyzing Wisconsin's Performance
+By filtering out results dataframe, we could easily calculate how many times Wisconsin made the Sweet Sixteen, Final Four, and won the Champions based on how many times they won specific games. These numbers allowed us to calculate the probabilities that Wisconsin made the Final Four and Won the Championship conditional on making the Sweet Sixteen as follows:
+$$
+P(\text{Final Four} \mid \text{Sweet Sixteen}) 
+= \frac{N_\text{Final Four} }{N_\text{Sweet Sixteen}}
+$$
+
+$$
+P(\text{Win Championship} \mid \text{Sweet Sixteen}) 
+= \frac{N_\text{Champions} }{N_\text{Sweet Sixteen}}
+$$
+```{r}
+Wisconsin_sw16 <- results %>% filter(East_r32_3 == "Wisconsin") %>% nrow()
+Wisconsin_elite8 <- results %>% filter(East_r32_3 == "Wisconsin", East_s16_2 == "Wisconsin") %>% nrow()
+Wisconsin_final_four <- results %>% filter(East_r32_3 == "Wisconsin", East_champ == "Wisconsin") %>% nrow()
+Wisconsin_finals <- results %>% filter(East_r32_3 == "Wisconsin", Final_4_winner_1 == "Wisconsin") %>% nrow()
+Wisconsin_champ <- results %>% filter(East_r32_3 == "Wisconsin", Champion == "Wisconsin") %>% nrow()
+
+Elite8_odds <- (Wisconsin_elite8 / Wisconsin_sw16) * 100
+Final_four_odds <- (Wisconsin_final_four / Wisconsin_sw16) * 100
+Finals_odds <- (Wisconsin_finals / Wisconsin_sw16) * 100
+Champion_odds <- (Wisconsin_champ / Wisconsin_sw16) * 100
+
+Wisconsin_odds_df <- data.frame(
+  Round = c("Sweet 16","Elite 8", "Final Four", "Finals", "Champion"),
+  Total = c(Wisconsin_sw16, Wisconsin_elite8, Wisconsin_final_four, Wisconsin_finals, Wisconsin_champ),
+  Probability = c(round(Wisconsin_sw16/(n_sims/100),2), round(Elite8_odds,2), round(Final_four_odds,2),
+                  round(Finals_odds,2), round(Champion_odds,2)))
+  
+Wisconsin_odds_df <- Wisconsin_odds_df %>% arrange(desc(Total)) %>% mutate(Round = factor(Round, levels = Round))
+```
+
+### Wisconsin Round Comparison
+With Wisconsin’s high likelihood of reaching the Sweet Sixteen established, we then analyzed their prospects for a deeper tournament run. The “Wisconsin: Total Appearances by Round” chart visualizes this.
+```{r}
+ggplot(Wisconsin_odds_df, aes(x = Round, y = Total)) +
+  geom_col(fill = "red", width = 0.9, color = "black") +
+  geom_text(aes(label = Total), vjust = -0.3, size = 4) +
+  labs(title = "Wisconsin: Total Appearances by Round (10,000 Simulations)",
+       x = "Round Type",
+       y = "Number of Appearances") +
+  ylim(0,7000) +
+  theme_classic()
+
+```
+
+Of the 6,279 simulations where the Badgers made the Sweet Sixteen:
+
+  * They advanced to the Final Four in only 539 of those simulations
+  * They won the entire tournament, becoming Champions, in an even smaller 25 of those simulations
+
+
+### Wisconsin Conditonal Probabilities Comparison
+These raw counts translate to a conditional probability of 8.58% to reach the Final Four and a 0.4% chance to win the championship, given they had already made the Sweet Sixteen. These results powerfully illustrate the central theme of March Madness: while the Badgers were strong enough to consistently win their first two games, the path from the Sweet Sixteen to a championship is incredibly narrow, with the odds decreasing each round. These odds are displayed in the graph below:
+```{r}
+ggplot(Wisconsin_odds_df[2:5,], aes(x = Round, y = Probability)) +
+  geom_col(fill = "red", width = 0.8, color = "black") +
+  geom_text(aes(label = paste0(Probability,"%")), vjust = -0.3, size = 4) +
+  labs(title = "Wisconsin: Conditional Probabilities",
+       subtitle = "Given Wisconsin makes the Sweet 16",
+       x = "Tournament Acheivement",
+       y = "Probability (%)") +
+  ylim(0, 40) + 
+  theme_classic()
+```
+
+
+### Conclusion
+Our model confirms that Wisconsin was, without a doubt, a formidable team. Their ability to reach the Sweet Sixteen in over 60% of our simulated brackets validates their high seed and demonstrates a consistent strength that positioned them above most of their three-seeded peers.
+
+However, our analysis also quantifies the sheer difficulty and volatility of the NCAA tournament. The probabilities at just 8.58% to reach the Final Four and a remote 0.4% to win the championship, conditional on securing a Sweet Sixteen spot, highlight that a deep run was possible, but highly improbable. Wisconsin's actual early exit, while disappointing, is a scenario well within the range of probable outcomes for any team, no matter how strong.
+
+This analysis provides a probabilistic lens for fans and coaches alike. It moves beyond simple seeding to show how statistical modeling can capture the high-variance nature of a single-elimination tournament. Ultimately, our findings show that in 2025, Wisconsin was a strong contender capable of making a deep run in March Madness, but the Badgers' path to a championship would have been a challenging and unlikely one, defined by the same statistical uncertainty that makes March Madness one of the most exciting events in sports.
+
+
+
+
+
+
